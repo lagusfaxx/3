@@ -19,6 +19,7 @@ from .services.analysis import local_analyze, gateway_analyze
 from .settings import settings
 from .services.gateway_client import gateway_chat
 from .services.report_pdf import build_report_pdf
+from .services.tender_automation import evaluate_tender_opportunity, telegram_command_router
 from .prompts import (
     SYSTEM_BROWSER_CONNECT,
     SYSTEM_TENDER_SEARCH_PLANNER,
@@ -28,6 +29,9 @@ from .prompts import (
     SYSTEM_COMPRA_AGIL_DETAIL,
     SYSTEM_COMPRA_AGIL_DOWNLOAD,
     SYSTEM_COMPRA_AGIL_SOURCE_MISSING,
+    SYSTEM_AUTOMATION_EVALUATOR,
+    SYSTEM_AUTOMATION_PROPOSAL,
+    SYSTEM_TELEGRAM_ROUTER,
     connect_open_browser_prompt,
     confirm_login_prompt,
     build_search_planner_prompt,
@@ -37,6 +41,9 @@ from .prompts import (
     build_compra_agil_download_prompt,
     build_compra_agil_source_missing_prompt,
     build_proposal_prompt,
+    build_automation_evaluation_prompt,
+    build_automation_proposal_prompt,
+    build_telegram_router_prompt,
 )
 from .services.storage import get_connector_state, set_connector_state
 
@@ -57,6 +64,7 @@ from .services.storage import (
 
 import csv
 import io
+import json
 from pathlib import Path
 import re
 
@@ -68,6 +76,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+TELEGRAM_SESSIONS: dict[str, dict] = {}
 
 def _user_id(x_user_id: str | None) -> str:
     # Demo: si no viene user, usamos demo
@@ -724,3 +734,157 @@ def jobs_get(job_id: int):
     if not job:
         raise HTTPException(status_code=404, detail="Job no encontrado")
     return job
+
+
+@app.post("/automation/evaluate", response_model=ActionResponse)
+async def automation_evaluate(req: ActionRequest):
+    init_db()
+    user_id = req.user_id
+    job_id = create_job(user_id, "automation_evaluate", payload_json=json.dumps(req.payload or {}, ensure_ascii=False))
+    tender = req.payload.get("tender") or {}
+    provider_offers = req.payload.get("provider_offers") or []
+    if not tender:
+        finish_job(job_id, "FAILED", error="payload.tender requerido")
+        raise HTTPException(status_code=400, detail="payload.tender requerido")
+
+    company = get_company(user_id) or {}
+    inventory = list_inventory(user_id)
+    truth = build_truth_block(company, inventory)
+
+    result = None
+    if settings.use_gateway:
+        prompt = build_automation_evaluation_prompt(truth_block=truth, tender=tender, provider_offers=provider_offers)
+        session_key = f"agent:{settings.openclaw_agent_id}:tenant:demo:user:{user_id}"
+        try:
+            raw = await gateway_chat(prompt, system=SYSTEM_AUTOMATION_EVALUATOR, user_id=user_id, session_key=session_key)
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict) and parsed.get("ok") is not None:
+                result = parsed
+        except Exception:
+            result = None
+
+    if result is None:
+        result = evaluate_tender_opportunity(
+            tender=tender,
+            inventory=inventory,
+            company=company,
+            provider_offers=provider_offers,
+        )
+
+    status = "OK" if result.get("ok") else "ERROR"
+    finish_job(
+        job_id,
+        "DONE" if status == "OK" else "DONE_WITH_WARNINGS",
+        result_json=json.dumps(result, ensure_ascii=False),
+        raw="",
+        error=None,
+    )
+    return ActionResponse(ok=status == "OK", action=req.action or "automation_evaluate", status=status, result=result, raw="")
+
+
+@app.post("/automation/proposal_pdf")
+async def automation_proposal_pdf(req: ActionRequest):
+    init_db()
+    user_id = req.user_id
+    job_id = create_job(user_id, "automation_proposal_pdf", payload_json=json.dumps(req.payload or {}, ensure_ascii=False))
+    tender = req.payload.get("tender") or {}
+    analysis = req.payload.get("analysis") or {}
+    selected_plan = req.payload.get("selected_plan") or "equilibrado"
+
+    plans = analysis.get("plans") or []
+    plan = next((p for p in plans if p.get("plan") == selected_plan), None) or (plans[0] if plans else {})
+    missing = analysis.get("missing_procurement") or []
+
+    proposal_sections = None
+    if settings.use_gateway:
+        prompt = build_automation_proposal_prompt(tender=tender, analysis=analysis, selected_plan=selected_plan)
+        session_key = f"agent:{settings.openclaw_agent_id}:tenant:demo:user:{user_id}"
+        try:
+            raw = await gateway_chat(prompt, system=SYSTEM_AUTOMATION_PROPOSAL, user_id=user_id, session_key=session_key)
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                proposal_sections = parsed
+        except Exception:
+            proposal_sections = None
+
+    if proposal_sections:
+        md = (
+            f"# Propuesta automática\n"
+            f"Licitación: {tender.get('title', 'Sin título')}\n\n"
+            f"## Resumen\n{proposal_sections.get('summary', '')}\n\n"
+            f"## Oferta técnica\n{proposal_sections.get('technical_offer', '')}\n\n"
+            f"## Oferta comercial\n{proposal_sections.get('commercial_offer', '')}\n\n"
+            f"## Condiciones de entrega\n{proposal_sections.get('delivery_terms', '')}\n"
+        )
+    else:
+        md = (
+            f"# Propuesta automática\n"
+            f"Licitación: {tender.get('title', 'Sin título')}\n\n"
+            f"Plan seleccionado: {plan.get('label', selected_plan)}\n"
+            f"Margen: {plan.get('margin_pct', 'N/A')}%\n"
+            f"Oferta total: {plan.get('offer_total', 'N/A')}\n"
+            f"Ganancia estimada: {plan.get('estimated_profit', 'N/A')}\n"
+            f"Probabilidad adjudicación: {plan.get('award_probability', 'N/A')}\n\n"
+            f"## Faltantes y compras sugeridas\n"
+            + "\n".join(
+                [
+                    f"- {m.get('item')}: faltan {m.get('missing_qty')} | proveedor sugerido: "
+                    f"{((m.get('supplier_offer') or {}).get('supplier') or 'sin proveedor')}"
+                    for m in missing
+                ]
+            )
+        )
+
+    pdf_bytes = build_report_pdf(
+        title="Agente X — Propuesta de Licitación",
+        filename=tender.get("title") or "licitacion",
+        summary="Propuesta generada automáticamente desde el flujo Telegram.",
+        requirements=[str(i.get("name") or i.get("item")) for i in (tender.get("items") or [])],
+        risks=[f"Risk score: {plan.get('risk_score', 'N/A')}"],
+        opportunities=[f"Expected value: {plan.get('expected_value', 'N/A')}"],
+        required_items=[str(i.get("name") or i.get("item")) for i in (tender.get("items") or [])],
+        inventory_matches=[],
+        proposal_markdown=md,
+    )
+    finish_job(job_id, "DONE", result_json=json.dumps({"selected_plan": selected_plan}, ensure_ascii=False), raw="", error=None)
+    safe_name = (str(tender.get("title") or "propuesta").replace("/", "-").strip() or "propuesta")
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}_propuesta.pdf"'},
+    )
+
+
+@app.post("/telegram/webhook", response_model=dict)
+async def telegram_webhook(payload: dict):
+    user_id = str(payload.get("user_id") or payload.get("chat_id") or "demo")
+    text = str(payload.get("text") or "")
+    state = TELEGRAM_SESSIONS.setdefault(user_id, {"stage": "idle"})
+
+    routed = None
+    if settings.use_gateway:
+        prompt = build_telegram_router_prompt(text=text, state=state)
+        session_key = f"agent:{settings.openclaw_agent_id}:tenant:demo:user:{user_id}"
+        try:
+            raw = await gateway_chat(prompt, system=SYSTEM_TELEGRAM_ROUTER, user_id=user_id, session_key=session_key)
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                routed = parsed
+        except Exception:
+            routed = None
+
+    if routed is None:
+        routed = telegram_command_router(text, state)
+
+    next_stage = routed.get("stage")
+    if next_stage:
+        state["stage"] = next_stage
+    if routed.get("selected_plan"):
+        state["selected_plan"] = routed.get("selected_plan")
+
+    return {
+        "ok": True,
+        "user_id": user_id,
+        "state": state,
+        "reply": routed.get("reply", "Sin respuesta"),
+    }

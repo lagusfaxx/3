@@ -104,3 +104,38 @@ frontend/
 ## Informe descargable (PDF)
 
 - Después de analizar un PDF, puedes generar un **informe PDF** con el endpoint `POST /report` (lo usa el botón **Descargar informe PDF** en Streamlit).
+
+## Flujo extendido (automatización estilo Telegram)
+
+Se añadieron endpoints para cubrir un flujo más completo de licitaciones operado por comandos:
+
+- `POST /automation/evaluate`
+  - Evalúa una licitación con inventario, faltantes, costos, riesgo y probabilidad de adjudicación.
+  - Genera planes: `competitivo`, `equilibrado`, `rentable`.
+- `POST /automation/proposal_pdf`
+  - Con análisis + plan elegido, genera PDF de propuesta listo para envío.
+- `POST /telegram/webhook`
+  - Router básico de comandos Telegram (`/buscar`, `/analizar`, `/planes`, `/confirmar`).
+- Compatibilidad con prompts preestablecidos: cuando `USE_GATEWAY=true`, estos endpoints usan system/user prompts fijos; si falla el gateway, hacen fallback automático al motor local determinístico.
+
+Ejemplo mínimo de `POST /automation/evaluate`:
+
+```json
+{
+  "user_id": "demo1",
+  "action": "automation_evaluate",
+  "payload": {
+    "tender": {
+      "title": "Compra de monitores",
+      "deadline_days": 2,
+      "items": [
+        {"name": "Monitor 24", "qty": 10},
+        {"name": "Monitor 27", "qty": 4}
+      ]
+    },
+    "provider_offers": [
+      {"name": "Monitor 24", "supplier": "Proveedor A", "unit_cost": 98, "stock": 50}
+    ]
+  }
+}
+```

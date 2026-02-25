@@ -93,6 +93,32 @@ Reglas:
 Devuelve SIEMPRE JSON válido (sin markdown).
 """
 
+
+SYSTEM_AUTOMATION_EVALUATOR = """Eres Agente X. Evalúa si conviene participar en una licitación usando SOLO datos entregados en el prompt.
+
+Reglas:
+- No inventes stock, costos ni precios.
+- Si falta información crítica, marca supuestos explícitos.
+- Devuelve SIEMPRE JSON válido (sin markdown).
+"""
+
+SYSTEM_AUTOMATION_PROPOSAL = """Eres Agente X. Redacta una propuesta comercial/técnica para licitación en base a análisis ya calculado.
+
+Reglas:
+- No inventes datos financieros.
+- Usa el plan seleccionado por el usuario.
+- Devuelve SIEMPRE JSON válido (sin markdown).
+"""
+
+SYSTEM_TELEGRAM_ROUTER = """Eres Agente X operando por Telegram.
+
+Reglas:
+- Interpreta comandos cortos del usuario.
+- Responde en español, claro y accionable.
+- Mantén estado de etapa conversacional.
+- Devuelve SIEMPRE JSON válido (sin markdown).
+"""
+
 # ============================
 # USER PROMPTS (templated)
 # ============================
@@ -253,5 +279,95 @@ Devuelve SOLO JSON con campos:
   "commercial_offer": "",
   "delivery_terms": "",
   "compliance_checklist": [""]
+}}
+"""
+
+
+def build_automation_evaluation_prompt(*, truth_block: str, tender: Dict[str, Any], provider_offers: List[Dict[str, Any]]) -> str:
+    return f"""Evalúa esta licitación para decidir participación y planes de oferta.
+
+SOURCE OF TRUTH:
+{truth_block}
+
+LICITACIÓN (JSON):
+{json.dumps(tender, ensure_ascii=False)}
+
+OFERTAS PROVEEDORES (JSON):
+{json.dumps(provider_offers, ensure_ascii=False)}
+
+Devuelve SOLO JSON con:
+{{
+  "ok": true,
+  "summary": {{
+    "tender_title": "",
+    "total_items": 0,
+    "total_cost": 0,
+    "inventory_cost": 0,
+    "procurement_cost": 0,
+    "missing_items": 0
+  }},
+  "item_analysis": [
+    {{
+      "item": "",
+      "qty": 0,
+      "from_inventory": 0,
+      "missing_qty": 0,
+      "estimated_item_cost": 0
+    }}
+  ],
+  "plans": [
+    {{
+      "plan": "competitivo|equilibrado|rentable",
+      "label": "",
+      "margin_pct": 0,
+      "offer_total": 0,
+      "estimated_profit": 0,
+      "risk_score": 0,
+      "award_probability": 0,
+      "expected_value": 0,
+      "recommended": false
+    }}
+  ],
+  "missing_procurement": [{{"item": "", "missing_qty": 0, "supplier_offer": null}}]
+}}
+"""
+
+
+def build_automation_proposal_prompt(*, tender: Dict[str, Any], analysis: Dict[str, Any], selected_plan: str) -> str:
+    return f"""Genera el texto de propuesta para la licitación, usando el análisis calculado.
+
+LICITACIÓN (JSON):
+{json.dumps(tender, ensure_ascii=False)}
+
+ANÁLISIS (JSON):
+{json.dumps(analysis, ensure_ascii=False)}
+
+PLAN SELECCIONADO: {selected_plan}
+
+Devuelve SOLO JSON con:
+{{
+  "summary": "",
+  "technical_offer": "",
+  "commercial_offer": "",
+  "delivery_terms": "",
+  "missing_items_notes": [""]
+}}
+"""
+
+
+def build_telegram_router_prompt(*, text: str, state: Dict[str, Any]) -> str:
+    return f"""Interpreta este mensaje Telegram y define la siguiente respuesta/estado.
+
+ESTADO ACTUAL (JSON):
+{json.dumps(state, ensure_ascii=False)}
+
+MENSAJE USUARIO:
+{text}
+
+Devuelve SOLO JSON con:
+{{
+  "reply": "",
+  "stage": "idle|searching|analysis|plans|confirmed",
+  "selected_plan": ""
 }}
 """
